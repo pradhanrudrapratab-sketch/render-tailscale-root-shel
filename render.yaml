@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: render-tailscale-root-shell
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: TS_AUTHKEY
+        sync: false
+      - key: ROOT_PASSWORD
+        sync: false
+      - key: ROOT_PASSWORD_CONFIRM
+        sync: false
+      - key: TS_HOSTNAME
+        value: render-root-shell
