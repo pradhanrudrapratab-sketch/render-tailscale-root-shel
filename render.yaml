@@ -7,6 +7,8 @@ services:
     envVars:
       - key: TS_AUTHKEY
         sync: false
+      - key: TS_CONFIG_JSON
+        sync: false
       - key: ROOT_PASSWORD
         sync: false
       - key: ROOT_PASSWORD_CONFIRM

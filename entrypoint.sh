@@ -13,6 +13,8 @@ SSHD_CONFIG="/etc/ssh/sshd_config_render"
 
 TS_SOCKET="/var/run/tailscale/tailscaled.sock"
 TS_STATE="/var/lib/tailscale/tailscaled.state"
+TS_CONFIG_FILE="/var/lib/tailscale/config.json"
+TS_CONFIG_JSON="${TS_CONFIG_JSON:-}"
 TS_HOSTNAME="${TS_HOSTNAME:-render-root-shell}"
 
 MONITOR_INTERVAL="${MONITOR_INTERVAL_SECONDS:-3600}"   # 60 min default
@@ -47,18 +49,24 @@ port_open() { timeout 2 bash -c "exec 3<>/dev/tcp/$1/$2" >/dev/null 2>&1; }
 # ----------------------------------------------------------------------------
 validate_env() {
   local missing=0 v
-  for v in TS_AUTHKEY ROOT_PASSWORD ROOT_PASSWORD_CONFIRM; do
+  for v in ROOT_PASSWORD ROOT_PASSWORD_CONFIRM; do
     if [ -z "${!v:-}" ]; then
       err "Missing required environment variable: $v"
       missing=1
     fi
   done
+  if [ -z "${TS_AUTHKEY:-}" ] && [ -z "$TS_CONFIG_JSON" ]; then
+    err "Set TS_AUTHKEY for first authentication, or TS_CONFIG_JSON with a saved Tailscale state."
+    missing=1
+  fi
   [ "$missing" -eq 0 ] || die "Set the missing variable(s) in Render -> Environment and redeploy."
 
-  case "$TS_AUTHKEY" in
-    tskey-*) ;;
-    *) die "TS_AUTHKEY does not look like a Tailscale key (expected it to start with 'tskey-')." ;;
-  esac
+  if [ -n "${TS_AUTHKEY:-}" ]; then
+    case "$TS_AUTHKEY" in
+      tskey-*) ;;
+      *) die "TS_AUTHKEY does not look like a Tailscale key (expected it to start with 'tskey-')." ;;
+    esac
+  fi
 
   [ "$ROOT_PASSWORD" = "$ROOT_PASSWORD_CONFIRM" ] \
     || die "ROOT_PASSWORD and ROOT_PASSWORD_CONFIRM do not match."
@@ -73,7 +81,12 @@ validate_env() {
   [[ "$TS_HOSTNAME" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]] \
     || die "TS_HOSTNAME '$TS_HOSTNAME' is invalid (letters, digits, hyphens only)."
 
-  info "Environment OK (TS_AUTHKEY: set/masked, ROOT_PASSWORD: set/masked, hostname: $TS_HOSTNAME)"
+  if [ -n "$TS_CONFIG_JSON" ]; then
+    printf '%s' "$TS_CONFIG_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); s=d.get("tailscale",{}).get("state",""); assert isinstance(s,str) and s.strip(), "missing tailscale.state"' \
+      || die "TS_CONFIG_JSON is not valid config JSON or does not contain tailscale.state."
+  fi
+
+  info "Environment OK (TS_AUTHKEY: set/masked, ROOT_PASSWORD: set/masked, hostname: $TS_HOSTNAME, persisted state: $([ -n "$TS_CONFIG_JSON" ] && echo supplied || echo absent))"
 }
 
 # ----------------------------------------------------------------------------
@@ -139,7 +152,46 @@ EOF
 }
 
 # ----------------------------------------------------------------------------
-# 5. Tailscale daemon (userspace networking, no TUN, no systemd)
+# 5. Import/export persistent Tailscale state through TS_CONFIG_JSON.
+# config.json contains a Base64-encoded tailscaled.state value. It is a
+# credential: never print it in logs. Copy it manually into Render env.
+# ----------------------------------------------------------------------------
+import_ts_state() {
+  mkdir -p /var/lib/tailscale
+  if [ -n "$TS_CONFIG_JSON" ]; then
+    local encoded
+    encoded=$(printf '%s' "$TS_CONFIG_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tailscale"]["state"])')
+    if ! printf '%s' "$encoded" | base64 -d > "$TS_STATE" 2>/dev/null || [ ! -s "$TS_STATE" ]; then
+      rm -f "$TS_STATE"
+      die "TS_CONFIG_JSON state is not valid Base64. Replace it with a valid exported config.json."
+    fi
+    chmod 600 "$TS_STATE"
+    info "Imported persisted Tailscale state from TS_CONFIG_JSON"
+  fi
+}
+
+export_ts_state() {
+  if [ -s "$TS_STATE" ]; then
+    local encoded
+    encoded=$(base64 -w0 "$TS_STATE")
+    python3 - "$TS_CONFIG_FILE" "$encoded" "$TS_HOSTNAME" <<'PYCFG'
+import json, os, sys
+path, state, hostname = sys.argv[1:]
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump({"version": 1, "tailscale": {"state": state, "hostname": hostname}}, f, separators=(",", ":"))
+    f.write("\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+PYCFG
+    info "Updated local config.json with the current Tailscale state (secret not logged)"
+  else
+    warn "Tailscale state file is not present yet; config.json was not exported"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# 6. Tailscale daemon (userspace networking, no TUN, no systemd)
 # ----------------------------------------------------------------------------
 start_tailscaled() {
   if pgrep -x tailscaled >/dev/null 2>&1; then
@@ -166,20 +218,31 @@ start_tailscaled() {
   info "tailscaled started (pid ${pid}, userspace networking)"
 }
 
-# 6. Authenticate
+# 7. Authenticate only when existing imported state is not already connected.
 ts_up() {
-  local out
-  info "Authenticating with Tailscale (hostname: ${TS_HOSTNAME})..."
+  local state out
+  state="$(ts_backend_state)"
+  if [ "$state" = "Running" ]; then
+    info "Tailscale already Running; preserving existing device identity"
+    export_ts_state
+    return 0
+  fi
+
+  if [ -z "${TS_AUTHKEY:-}" ]; then
+    err "No active persisted Tailscale session and TS_AUTHKEY is not set; provide a valid auth key to authenticate."
+    return 1
+  fi
+  info "Tailscale backend state is '${state:-unknown}'; authenticating/reconnecting (hostname: ${TS_HOSTNAME})..."
   if ! out=$(timeout 90 tailscale --socket="$TS_SOCKET" up \
         --auth-key="$TS_AUTHKEY" \
         --hostname="$TS_HOSTNAME" \
-        --accept-dns=false \
-        --reset 2>&1); then
+        --accept-dns=false 2>&1); then
     err "tailscale up failed:"
     redact "$out" | sed 's/^/    /' >&2
-    err "Hints: key expired/revoked? one-time key already used? use a reusable + ephemeral key."
+    err "Hints: if imported state is invalid, replace TS_CONFIG_JSON; if no state exists, use a valid reusable auth key."
     return 1
   fi
+  export_ts_state
   return 0
 }
 
@@ -313,6 +376,8 @@ monitor_once() {
     warn "monitor: Tailscale state is '${state:-unknown}', attempting reconnect"
     ts_up || { err "monitor: reconnect FAILED"; return 1; }
     recovered=1
+  else
+    export_ts_state
   fi
 
   if ! serve_ok; then
@@ -344,6 +409,7 @@ main() {
   validate_env
   configure_root_password
   start_sshd
+  import_ts_state
   start_tailscaled
   ts_up || die "Tailscale authentication failed - see errors above."
 
