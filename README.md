@@ -39,11 +39,29 @@ Revoke the key when you're done testing.
 
 | Variable | Value |
 |---|---|
-| `TS_AUTHKEY` | `tskey-auth-...` |
+| `TS_AUTHKEY` | Initial authentication key (`tskey-auth-...`). Optional after a valid state is saved in `TS_CONFIG_JSON`. |
+| `TS_CONFIG_JSON` | Optional full JSON copied from the runtime `/var/lib/tailscale/config.json`; leave unset on first boot. Treat as a secret. |
 | `ROOT_PASSWORD` | strong, unique, 12+ chars |
 | `ROOT_PASSWORD_CONFIRM` | same as above |
 | `TS_HOSTNAME` | optional (default `render-root-shell`) |
 | `MONITOR_INTERVAL_SECONDS` | optional (default `3600`) |
+
+### Preserve the Tailscale identity across Render restarts (Option B)
+
+Render's filesystem is ephemeral, so the daemon's `tailscaled.state` is not automatically retained between new instances. This version exports the current state to `/var/lib/tailscale/config.json` as a Base64 string and imports it from the `TS_CONFIG_JSON` environment variable on startup.
+
+1. Deploy the first time with a valid `TS_AUTHKEY` and without `TS_CONFIG_JSON`.
+2. Connect to the shell once it is online. In the shell, display the file:
+
+   ```bash
+   cat /var/lib/tailscale/config.json
+   ```
+
+3. Copy the complete one-line JSON output. In Render → your service → Environment, create/update `TS_CONFIG_JSON` and paste the full JSON value. Save and redeploy.
+4. On subsequent starts, the container imports that state and checks Tailscale status first. If the backend is already `Running`, it skips `tailscale up` and does not reset the device identity. `TS_AUTHKEY` can then be removed from Render; keep it available only if a fresh authentication may be needed.
+5. If the daemon's state changes during its lifetime, the local `config.json` is refreshed. To preserve the latest state for a future Render instance, copy the refreshed JSON into `TS_CONFIG_JSON` again.
+
+**Security:** `config.json` contains reusable Tailscale device credentials. Anyone who obtains it may be able to impersonate this node. Never commit it, share it, or print it in deployment logs. Base64 is encoding, not encryption. Store the value only in a private Render environment variable. The application deliberately never logs the JSON/state itself.
 
 ### 3. Read the logs
 After deploy, look for:
@@ -89,7 +107,7 @@ Tag the key `tag:render` and add something like this to your tailnet policy (mer
 
 ## Startup order
 
-validate env → check password confirmation → set root password → start sshd → start tailscaled → `tailscale up` → get IPv4 → `tailscale serve` → health server → print banner → monitor.
+validate env → check password confirmation → set root password → start sshd → import saved state (if supplied) → start tailscaled → reuse a Running session or authenticate if needed → export local state to `config.json` → get IPv4 → `tailscale serve` → health server → print banner → monitor.
 
 Any critical failure prints a clear `[ERROR]` line and exits non-zero (Render restarts the service). Nothing is silently ignored.
 
@@ -132,7 +150,7 @@ Acceptance checklist:
 ## Known limitations (Render)
 
 - **Free tier sleeps** after ~15 min without inbound HTTP. UptimeRobot pings keep it awake, but free instance hours are still capped and Render can restart/redeploy at any time.
-- **Ephemeral filesystem**: anything you install or save as root disappears on restart/redeploy. Tailscale state is also lost, so each restart re-authenticates with the auth key (hence reusable + ephemeral).
+- **Ephemeral filesystem**: anything you install or save as root disappears on restart/redeploy. Tailscale identity persistence therefore depends on copying the latest `/var/lib/tailscale/config.json` into the `TS_CONFIG_JSON` Render environment variable. The app can refresh the local file, but Render environment variables are not writable from inside the service.
 - **No TUN, no systemd**: Tailscale runs in userspace mode. Only inbound TCP forwarded by Serve works (SSH). Outbound tailnet access from inside the shell needs `tailscale nc` or a SOCKS5 proxy.
 - If `tailscale serve` asks you to enable Serve for your tailnet, open the URL it prints once, then redeploy.
 - Check Render's terms/acceptable-use policy before using this long term.

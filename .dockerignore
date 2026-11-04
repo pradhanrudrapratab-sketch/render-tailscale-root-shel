@@ -1,0 +1,16 @@
+.git
+.gitignore
+.github
+.env
+.env.*
+*.env
+*.key
+*.pem
+*.log
+*.md
+render.yaml
+.vscode
+.idea
+__pycache__
+*.pyc
+.DS_Store
